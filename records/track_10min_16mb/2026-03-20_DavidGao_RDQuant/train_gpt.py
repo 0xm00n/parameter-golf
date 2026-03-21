@@ -98,6 +98,10 @@ class Hyperparameters:
     qat = bool(int(os.environ.get("QAT", "0")))
     quant_bits = int(os.environ.get("QUANT_BITS", 6))
 
+    # Attention variant: "standard", "shared_kv", "latent_kv", "single_kv"
+    attn_variant = os.environ.get("ATTN_VARIANT", "standard")
+    latent_kv_dim = int(os.environ.get("LATENT_KV_DIM", 64))
+
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
@@ -420,12 +424,18 @@ def mixed_quantize_rdquant(state_dict: dict[str, Tensor],
             meta[name] = {"type": spec, "bits": bits, "deadzone": deadzone}
             continue
 
-        # Default: quantize mlp+attn with int6, others with int8
+        # Default: int5 for MLP, int6 for attention (fits 11L under 16MB)
         if cat in default_quant_cats and t.ndim >= 1:
-            q, s = quantize_per_row_mixed(t, bits=6, deadzone=0.0)
-            result[name + ".q"] = q
-            result[name + ".scale"] = s
-            meta[name] = {"type": "int6", "bits": 6, "deadzone": 0.0}
+            if cat == "mlp":
+                q, s = quantize_per_row_mixed(t, bits=5, deadzone=1.0)
+                result[name + ".q"] = q
+                result[name + ".scale"] = s
+                meta[name] = {"type": "int5_dz1", "bits": 5, "deadzone": 1.0}
+            else:
+                q, s = quantize_per_row_mixed(t, bits=6, deadzone=0.0)
+                result[name + ".q"] = q
+                result[name + ".scale"] = s
+                meta[name] = {"type": "int6", "bits": 6, "deadzone": 0.0}
         else:
             # int8 fallback for non-categorized large tensors
             q, s = quantize_per_row_mixed(t, bits=8, deadzone=0.0)
@@ -649,6 +659,120 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
+class SharedKVAttention(nn.Module):
+    """K and V share the same projection — halves KV params.
+    V = linear_transform(K) so they're related but not identical."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_kv = CastedLinear(dim, kv_dim, bias=False)  # shared projection
+        self.v_transform = nn.Parameter(torch.eye(self.head_dim, dtype=torch.float32))  # V = K @ transform
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = Rotary(self.head_dim, base=rope_base)
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        kv = self.c_kv(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k = kv
+        v = torch.matmul(kv, self.v_transform.to(dtype=kv.dtype))
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        n_rep = self.num_heads // self.num_kv_heads
+        if n_rep > 1:
+            k = k.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.head_dim)
+            v = v.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.head_dim)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
+class LatentKVAttention(nn.Module):
+    """DeepSeek MLA-inspired: compress KV through a low-rank bottleneck.
+    K,V = up_proj(down_proj(x)) instead of direct projection.
+    Saves params when latent_dim << kv_dim."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float, latent_dim: int = 64):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = dim // num_heads
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        # Low-rank KV: dim -> latent -> kv_dim (two smaller matrices instead of one big one)
+        self.kv_down = CastedLinear(dim, latent_dim, bias=False)
+        self.k_up = CastedLinear(latent_dim, kv_dim, bias=False)
+        self.v_up = CastedLinear(latent_dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = Rotary(self.head_dim, base=rope_base)
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        latent = self.kv_down(x)
+        k = self.k_up(latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_up(latent).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        n_rep = self.num_heads // self.num_kv_heads
+        if n_rep > 1:
+            k = k.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.head_dim)
+            v = v.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.head_dim)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
+class SingleKVAttention(nn.Module):
+    """Extreme: single KV head (MQA). Maximum param savings for KV."""
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        # Force 1 KV head regardless of num_kv_heads
+        self.num_kv_heads = 1
+        kv_dim = self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = Rotary(self.head_dim, base=rope_base)
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, dim = x.shape
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, 1, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, 1, self.head_dim).transpose(1, 2)
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+        cos, sin = self.rotary(seqlen, x.device, q.dtype)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        k = k.expand(-1, self.num_heads, -1, -1)
+        v = v.expand(-1, self.num_heads, -1, -1)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+        return self.proj(y)
+
+
 class MLP(nn.Module):
     def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
@@ -725,13 +849,27 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.to(dtype=h.dtype)
 
 
+def build_attention(variant: str, dim: int, num_heads: int, num_kv_heads: int,
+                    rope_base: float, qk_gain_init: float, latent_kv_dim: int = 64):
+    """Factory for attention variants."""
+    if variant == "shared_kv":
+        return SharedKVAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+    elif variant == "latent_kv":
+        return LatentKVAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, latent_kv_dim)
+    elif variant == "single_kv":
+        return SingleKVAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+    else:
+        return CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float,
-                 rope_base: float, qk_gain_init: float):
+                 rope_base: float, qk_gain_init: float, attn_variant: str = "standard",
+                 latent_kv_dim: int = 64):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = build_attention(attn_variant, dim, num_heads, num_kv_heads, rope_base, qk_gain_init, latent_kv_dim)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -762,6 +900,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        attn_variant: str = "standard",
+        latent_kv_dim: int = 64,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -779,7 +919,8 @@ class GPT(nn.Module):
         self.local_conv = LocalContextConv(model_dim, kernel_size=4)
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                      attn_variant=attn_variant, latent_kv_dim=latent_kv_dim)
                 for _ in range(num_layers)
             ]
         )
@@ -1035,6 +1176,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        attn_variant=args.attn_variant,
+        latent_kv_dim=args.latent_kv_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1106,7 +1249,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:{args.attn_variant} num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
