@@ -821,20 +821,17 @@ class DGAttention(nn.Module):
         dq = apply_rotary_emb(dq, cos, sin)
         dk = apply_rotary_emb(dk, cos, sin)
         dq = dq * self.q_gain.to(dtype=dq.dtype)[None, :, None, None]
-        # Payload via single projection + previous-token baseline
+        # Payload: project once, shift the result (exploits linearity of c_payload)
+        # c_payload(prev_token) = shift(c_payload(x)) — one matmul, not two
         projected_x = self.c_payload(x)
         if self.pure_raw:
             payload = projected_x
         elif self.pure_diff:
-            # Previous-token baseline: one shift, no cumsum
-            prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
-            projected_baseline = self.c_payload(prev)
-            payload = projected_x - projected_baseline
+            projected_prev = torch.cat([torch.zeros_like(projected_x[:, :1]), projected_x[:, :-1]], dim=1)
+            payload = projected_x - projected_prev
         else:
-            prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
-            projected_baseline = self.c_payload(prev)
-            diff_signal = projected_x - projected_baseline
-            payload = self.raw_mix * projected_x + (1.0 - self.raw_mix) * diff_signal
+            projected_prev = torch.cat([torch.zeros_like(projected_x[:, :1]), projected_x[:, :-1]], dim=1)
+            payload = projected_x - (1.0 - self.raw_mix) * projected_prev
         payload = payload.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         # Attention via asymmetric designators — use Flash Attention when available
         n_rep = self.num_heads // self.num_kv_heads
