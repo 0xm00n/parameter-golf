@@ -1668,6 +1668,18 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            # Log DG gate values if using DG attention
+            if args.attn_variant == "dg" and step % (args.train_log_every * 5) == 0:
+                betas, gammas = [], []
+                for i, block in enumerate(base_model.blocks):
+                    attn = block.attn
+                    if hasattr(attn, 'beta'):
+                        betas.append(f"L{i}:{torch.sigmoid(attn.beta).item():.3f}")
+                    if hasattr(attn, 'gamma'):
+                        gammas.append(f"L{i}:{torch.sigmoid(attn.gamma).item():.3f}")
+                if betas:
+                    log0(f"dg_beta(raw_vs_diff):[{','.join(betas)}]")
+                    log0(f"dg_gamma(local_vs_global):[{','.join(gammas)}]")
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
