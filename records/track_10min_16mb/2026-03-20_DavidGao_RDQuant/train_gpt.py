@@ -790,9 +790,9 @@ class DGAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        # Asymmetric D: separate query/key designators (narrower than standard Q/K)
-        d_dim = dim // 2
-        self.d_head_dim = d_dim // num_heads
+        # Asymmetric D: separate query/key designators (same dim as payload for Flash Attention)
+        self.d_head_dim = self.head_dim  # match payload dim for SDPA compatibility
+        d_dim = self.num_heads * self.d_head_dim
         dk_dim = self.num_kv_heads * self.d_head_dim
         self.c_dq = CastedLinear(dim, d_dim, bias=False)
         self.c_dk = CastedLinear(dim, dk_dim, bias=False)
@@ -829,16 +829,17 @@ class DGAttention(nn.Module):
         raw_signal = self.c_v(x)
         payload = (1 - mix) * diff_signal + mix * raw_signal
         payload = payload.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        # Attention via asymmetric designators
+        # Attention via asymmetric designators — use Flash Attention when available
         n_rep = self.num_heads // self.num_kv_heads
-        if n_rep > 1:
+        if _HAS_GQA and n_rep > 1:
+            # Native GQA: Flash Attention handles head repeat internally
+            y = F.scaled_dot_product_attention(dq, dk, payload, attn_mask=None, is_causal=True, enable_gqa=True)
+        elif n_rep > 1:
             dk = dk.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.d_head_dim)
             payload = payload.unsqueeze(2).expand(-1, -1, n_rep, -1, -1).reshape(bsz, -1, seqlen, self.head_dim)
-        scores = torch.matmul(dq, dk.transpose(-2, -1)) / (self.d_head_dim ** 0.5)
-        mask = torch.triu(torch.ones(seqlen, seqlen, device=x.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(mask[None, None, :, :], float('-inf'))
-        attn = torch.softmax(scores, dim=-1)
-        y = torch.matmul(attn, payload)
+            y = F.scaled_dot_product_attention(dq, dk, payload, attn_mask=None, is_causal=True)
+        else:
+            y = F.scaled_dot_product_attention(dq, dk, payload, attn_mask=None, is_causal=True)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
