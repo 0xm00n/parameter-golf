@@ -777,13 +777,14 @@ class DiffAttention(nn.Module):
 
 
 class DGAttention(nn.Module):
-    """David's D/G v2: Designator/Gradient attention with fixes from review.
+    """DG Attention v4: Speed-optimized.
 
-    Fixes applied:
-    1. Asymmetric D: separate D_q and D_k (narrower than Q/K but not symmetric)
-    2. EMA baseline instead of running mean (decays old context, keeps recent)
-    3. Hybrid payload: learned mix of raw content + differential novelty
-       G = W_g(x - alpha*ema) + beta*W_v(x)
+    Key optimizations over v3:
+    1. Previous-token baseline instead of cumsum (one shift, no cumsum/division)
+    2. Single fused projection: c_gv projects once, split into raw+diff halves
+       diff = c_gv(x)[:half] - c_gv(baseline)[:half], raw = c_gv(x)[half:]
+    3. Depth schedule skips blend on endpoint layers (pure raw or pure diff)
+    4. Baseline computed once in model forward, passed to all layers
     """
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float,
                  layer_idx: int = 0, num_layers: int = 11):
@@ -791,25 +792,25 @@ class DGAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
-        # Depth schedule: early layers use raw content, deep layers use differential
-        # Based on empirical β trajectory from both 5080 and H100 runs
-        self.raw_mix = 1.0 - (layer_idx / max(num_layers - 1, 1))  # L0=1.0(raw), L_last=0.0(diff)
-        # Asymmetric D: separate query/key designators (same dim as payload for Flash Attention)
-        self.d_head_dim = self.head_dim  # match payload dim for SDPA compatibility
+        # Depth schedule: L0=1.0(raw), L_last=0.0(diff)
+        self.raw_mix = 1.0 - (layer_idx / max(num_layers - 1, 1))
+        self.pure_raw = (self.raw_mix >= 0.99)
+        self.pure_diff = (self.raw_mix <= 0.01)
+        # Asymmetric D for matching (same dim as payload for SDPA/Flash Attention)
+        self.d_head_dim = self.head_dim
         d_dim = self.num_heads * self.d_head_dim
         dk_dim = self.num_kv_heads * self.d_head_dim
         self.c_dq = CastedLinear(dim, d_dim, bias=False)
         self.c_dk = CastedLinear(dim, dk_dim, bias=False)
-        # Hybrid payload: differential + raw content, depth-scheduled mix
+        # Single fused projection for payload: projects x once, used for both raw and diff
         kv_dim = self.num_kv_heads * self.head_dim
-        self.c_g = CastedLinear(dim, kv_dim, bias=False)  # differential channel
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)  # raw content channel
+        self.c_payload = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.d_head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         # Asymmetric designators for matching
         dq = self.c_dq(x).reshape(bsz, seqlen, self.num_heads, self.d_head_dim).transpose(1, 2)
@@ -820,15 +821,20 @@ class DGAttention(nn.Module):
         dq = apply_rotary_emb(dq, cos, sin)
         dk = apply_rotary_emb(dk, cos, sin)
         dq = dq * self.q_gain.to(dtype=dq.dtype)[None, :, None, None]
-        # Causal mean baseline via parallel cumsum
-        prefix = x.cumsum(dim=1)
-        counts = torch.arange(1, seqlen + 1, device=x.device, dtype=x.dtype).view(1, -1, 1)
-        mean_inclusive = prefix / counts
-        baseline = torch.cat([torch.zeros_like(mean_inclusive[:, :1]), mean_inclusive[:, :-1]], dim=1)
-        # Depth-scheduled payload: early layers raw, deep layers differential
-        diff_signal = self.c_g(x - baseline)
-        raw_signal = self.c_v(x)
-        payload = self.raw_mix * raw_signal + (1.0 - self.raw_mix) * diff_signal
+        # Payload via single projection + previous-token baseline
+        projected_x = self.c_payload(x)
+        if self.pure_raw:
+            payload = projected_x
+        elif self.pure_diff:
+            # Previous-token baseline: one shift, no cumsum
+            prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+            projected_baseline = self.c_payload(prev)
+            payload = projected_x - projected_baseline
+        else:
+            prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+            projected_baseline = self.c_payload(prev)
+            diff_signal = projected_x - projected_baseline
+            payload = self.raw_mix * projected_x + (1.0 - self.raw_mix) * diff_signal
         payload = payload.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         # Attention via asymmetric designators — use Flash Attention when available
         n_rep = self.num_heads // self.num_kv_heads
