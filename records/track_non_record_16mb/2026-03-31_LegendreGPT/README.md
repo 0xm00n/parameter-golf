@@ -116,8 +116,6 @@ Compression: mixed precision quantization (INT8 for Legendre orders 0-1, INT7 fo
 
 **Subformer** (Reid et al., 2021) showed that sandwich-style sharing (independent first/last layers, shared middle) works better than uniform sharing. I use the same structure.
 
-**PR #831 in this repo** ("Why Novel Architectures Fail at 16MB") found that 6 tested innovations failed because they couldn't co-optimize throughput and quantization. LegendreGPT avoids this: weight generation happens once per layer, and the resulting weights are standard dense matrices. torch.compile, tensor cores, and INT8 quantization all work unchanged. The novelty is in how weights are stored, not in the forward pass.
-
 ## What I'd Try Next
 
 - **2D compression:** Legendre polynomials for the depth axis, DCT for the width axis. Could push dim to 1024+ in 16 MB.
@@ -147,4 +145,4 @@ MODE=full RUN_ID=legendregpt \
 
 ## Author
 
-**Sergio Cernuda Cueto** -- AI Engineer at Samsung Zhilabs, CS student at Universidad Carlos III de Madrid (Spain).
+**Sergio Cernuda Cueto**
