@@ -7,10 +7,13 @@ LegendreGPT generates all transformer layer weights from a small set of Legendre
 | Metric | Value |
 |--------|-------|
 | Pre-quantization val_bpb | 1.2079 |
+| Post-quantization val_bpb (INT7+zlib) | 1.2353 |
 | Post-quantization val_bpb (mixed INT8/INT7+LZMA) | 1.2266 |
 | Compressed model size | 15.70 MB |
 | Architecture | dim=512, 24L (2 groups), g5/2, GQA 8/4 |
 | Training | 60k steps, 80 shards, 1x RTX 5090 (~27h) |
+
+Note: The INT7+zlib number (1.2353) is from the training script's built-in roundtrip validation (see train.log). The mixed INT8/INT7+LZMA number (1.2266) comes from a separate post-hoc quantization where Legendre orders 0-1 use INT8 and the rest use INT7, compressed with LZMA instead of zlib.
 
 ## How It Works
 
